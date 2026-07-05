@@ -1,9 +1,31 @@
 # Engram
 
 **Local-first associative memory for OpenClaw agents.** One command in, one
-command out. Sharp recall, honest "I don't know", procedural methods, future
-intentions, time-aware facts, and graph-walk retrieval — all on SQLite, no
-cloud dependencies.
+command out. All on SQLite — no cloud, no API keys, no vector database.
+
+## Why Engram
+
+- 🧠 **Remembers like a brain, not like grep** — hybrid recall fuses keyword,
+  semantic, tag, and graph channels, then a CPU cross-encoder reranks. Asks
+  "what do you know about the hosting setup" and gets the answer, not 50 log lines.
+- 🤐 **Honest "I don't know"** — calibrated abstention. When nothing is truly
+  grounded it says so instead of confabulating a plausible-sounding wrong answer.
+  For an agent memory, this is the feature everything else depends on.
+- ⏰ **Sets its own future reminders** — `engram intend "when X" "do Y"` arms a
+  prospective intention; the moment the trigger shows up in conversation context,
+  the reminder fires. Deterministic keyword matching, ~50ms, no LLM in the loop.
+- 📋 **Learns how, not just what** — procedural methods store the way a task was
+  done right (steps, pitfalls, verification); the next matching task gets the
+  playbook injected automatically.
+- 🕰️ **Knows what was true *when*** — bi-temporal facts: `asof "office address"
+  --date 2024-06-01` answers from that moment in time. Superseded facts get
+  demoted, never silently deleted.
+- 🔄 **Leaves no trace on the way out** — install backs up everything it touches
+  to a manifest; uninstall restores your workspace byte-identical. Verified by
+  a seeded recall battery generated from your own migrated content.
+- 🪫 **Runs on nothing** — pure Python + SQLite. Embeddings and reranking are
+  optional and degrade loudly to keyword-only mode. No cloud LLM calls anywhere
+  in the runtime.
 
 ## What it does
 
