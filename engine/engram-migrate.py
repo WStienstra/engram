@@ -66,9 +66,21 @@ PROJECT_PATTERNS = [
 ]
 
 
+EXPLICIT_MARKERS = {
+    "rule": "rule", "lesson": "lesson", "learned": "lesson", "warning": "lesson",
+    "contact": "contact", "decision": "decision", "fact": "fact",
+    "project": "project", "task": "project", "todo": "project",
+}
+
+
 def classify_text(text: str, heading_context: str = "") -> str:
     """Classify a text block into a node type."""
     combined = (heading_context + " " + text).lower()
+
+    # Explicit marker prefix wins over all heuristics: "- LESSON: ..." IS a lesson
+    m = re.match(r"\s*[-*]?\s*\**([A-Za-z]+)\**\s*:", text)
+    if m and m.group(1).lower() in EXPLICIT_MARKERS:
+        return EXPLICIT_MARKERS[m.group(1).lower()]
 
     # Check contact first (specific indicators)
     if re.search(r'[\w.]+@[\w.]+\.\w+', text):
@@ -159,24 +171,41 @@ def parse_markdown(filepath: str, source_label: str = None) -> list:
     current_section_lines = []
     section_start_line = 0
 
-    def flush_section():
-        if not current_section_lines:
-            return
-        text = ''.join(current_section_lines).strip()
+    def emit(text, line_no):
+        text = text.strip()
         if not text or len(text) < 20:  # skip trivially short
             return
         node_type = classify_text(text, current_heading)
         name = extract_name(text)
         tags = extract_tags(text)
         results.append({
-            "line": section_start_line,
+            "line": line_no,
             "heading": current_heading,
             "text": text,
-            "source": f"{source_label}#{section_start_line}",
+            "source": f"{source_label}#{line_no}",
             "type": node_type,
             "name": name,
             "tags": tags,
         })
+
+    def flush_section():
+        if not current_section_lines:
+            return
+        # Split the section into per-bullet items so one email in a list
+        # doesn't type every sibling bullet as a contact. Top-level bullets
+        # start an item; continuation/indented lines stay with their bullet;
+        # non-bullet prose is emitted as its own block.
+        item_lines, item_start = [], section_start_line
+        for off, ln in enumerate(current_section_lines):
+            line_no = section_start_line + off
+            if re.match(r"^[-*]\s+", ln):
+                if item_lines:
+                    emit("".join(item_lines), item_start)
+                item_lines, item_start = [ln], line_no
+            else:
+                item_lines.append(ln)
+        if item_lines:
+            emit("".join(item_lines), item_start)
 
     for i, line in enumerate(lines, 1):
         # Detect headings

@@ -1,6 +1,6 @@
 ---
 name: engram
-version: 1.1.1
+version: 1.1.2
 description: >
   One-install associative memory graph for any OpenClaw workspace: stage,
   migrate markdown memory, rewire, verify with a seeded battery, and revert.

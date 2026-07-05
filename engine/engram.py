@@ -1718,7 +1718,7 @@ def _lexical_grounding(db, query, nodes, trusted=False):
     the query's actual subject (e.g. "kubernetes") is in the engram. A
     real match should account for the bulk of what's distinctive about the
     query, not a coincidental fraction. Single-distinctive-word queries
-    (e.g. "kdence") fall back to requiring just that one word, since
+    (e.g. "kestrel") fall back to requiring just that one word, since
     there's nothing more specific to demand. `trusted=True` short-circuits
     this (used when a stricter upstream signal, e.g. the hub-entity name
     pin, already established genuine relevance)."""
