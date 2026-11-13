@@ -248,7 +248,18 @@ def node_tags(con, node_id):
 # ════════════════════════════════════════════════════════════════════════════
 # Ollama (local LLM) — graceful degradation
 # ════════════════════════════════════════════════════════════════════════════
+# --no-llm sets this. Every LLM path in this file goes through ollama_available(),
+# and each one already has a deterministic fallback for an unreachable ollama, so
+# one flag turns the whole pipeline arithmetic. Measured over 75 nights on a live
+# graph: 314 of 340 segments distilled to nothing, at roughly 2.5 minutes of local
+# GPU each. The deterministic run finishes in under a second. If your own log says
+# otherwise, keep the LLM on — this is a switch, not a verdict.
+LLM_DISABLED = False
+
+
 def ollama_available():
+    if LLM_DISABLED:
+        return False
     if _LLM_STATS["available"] is not None:
         return _LLM_STATS["available"]
     try:
@@ -425,7 +436,8 @@ Return ONLY the JSON array, nothing else. If nothing is worth keeping, return []
 def stage_distil(con, segments, report, apply_changes):
     report["distil"]["segments_considered"] = len(segments)
     if not ollama_available():
-        report["distil"]["skipped"] = "ollama/glm-5.1:cloud unavailable"
+        report["distil"]["skipped"] = ("--no-llm" if LLM_DISABLED
+                                       else f"ollama/{OLLAMA_MODEL} unavailable")
         return []
 
     candidates = []
@@ -498,6 +510,15 @@ def stage_merge(con, report, apply_changes):
 
     embs = fetch_embeddings(con, [r["id"] for r in rows])
     have = [r for r in rows if r["id"] in embs]
+
+    # Fewer than two vectors means there is no pair to compare. On a keyword-only
+    # install, or on a database nobody has run `embed` against yet, this is the
+    # normal case — it used to reach numpy and raise an AxisError on a 1-D array.
+    if len(have) < 2:
+        report["merge"]["pairs"] = []
+        report["merge"]["skipped"] = (f"{len(have)} of {len(rows)} candidates are "
+                                      f"embedded; need at least 2")
+        return []
 
     import numpy as np
     ids = [r["id"] for r in have]
@@ -860,7 +881,7 @@ def take_backup():
 # Main
 # ════════════════════════════════════════════════════════════════════════════
 def main():
-    global PRUNE_AGE_DAYS
+    global PRUNE_AGE_DAYS, LLM_DISABLED
     ap = argparse.ArgumentParser(
         description="Engram nightly sleep consolidation (dry-run by default).")
     mode = ap.add_mutually_exclusive_group()
@@ -875,11 +896,17 @@ def main():
     ap.add_argument("--merge", action="store_true", help="Run MERGE stage.")
     ap.add_argument("--prune", action="store_true", help="Run DECAY/PRUNE stage.")
     ap.add_argument("--prune-age-days", type=int, default=PRUNE_AGE_DAYS)
+    ap.add_argument("--no-llm", action="store_true",
+                    help="Skip every LLM call: no distillation, deterministic "
+                         "digests only. Turns a ~7-minute night into under a second.")
     ap.add_argument("--no-log", action="store_true",
                     help="Don't append the report to logs/engram-sleep.log.")
     args = ap.parse_args()
 
     PRUNE_AGE_DAYS = args.prune_age_days
+    LLM_DISABLED = bool(args.no_llm)
+    if LLM_DISABLED:
+        print("LLM stages disabled (--no-llm) — deterministic digests only")
 
     apply_changes = bool(args.apply)
     mode_str = "apply" if apply_changes else "dry-run"
@@ -894,7 +921,7 @@ def main():
     t0 = time.time()
     report = {
         "started": now_iso(),
-        "params": {"days": args.days,
+        "params": {"days": args.days, "no_llm": LLM_DISABLED,
                    "stages": [s for s, on in
                               (("segment", do_segment), ("distil", do_distil),
                                ("merge", do_merge), ("prune", do_prune)) if on]},

@@ -1,0 +1,16 @@
+# Files that must never leave this machine in a published bundle.
+#
+# build.py strips a specific workspace's names, paths and ids out of the
+# upstream engine, so its rename map *is* a list of those names. Publishing the
+# build script would publish exactly what the build script exists to remove.
+# engram_extras.py is its companion and is build-time only.
+#
+# Nothing here is needed to run Engram. install.sh does not copy either file.
+build.py
+engine/engram_extras.py
+
+# Generated handoff artifacts. Rebuild with: python3 build.py --emit-markers
+*.patch
+
+# CI scaffolding for this repo, not for an installed workspace.
+ci/

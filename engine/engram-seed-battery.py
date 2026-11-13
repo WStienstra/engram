@@ -3,13 +3,18 @@
 engram-seed-battery.py — Seeded mini-battery for install verification.
 
 Generates 20 recall cases FROM the migrated content in Engram, plus 3
-negative controls (things NOT in the engram). All 23 must pass for install
-to report success.
+negative controls (things NOT in the engram).
+
+The bar is 90% of the mined positives plus 3/3 negatives. A negative control
+passes only when the engine ran and said in words that it has nothing — an
+empty result is a broken engine, not an abstain. Any non-zero exit or traceback
+fails the whole run, whatever the score looks like.
 
 Usage:
   python3 engram/engram-seed-battery.py
 """
 
+import math
 import os
 import re
 import subprocess
@@ -37,15 +42,50 @@ how why can will just also more most other some such only own same so than too v
 een de het en van voor met op um die der und'''.split())
 
 
+# An abstain is a result, not a silence. The engine says one of these when it
+# has nothing worth reporting; anything else on a negative control is a hit.
+ABSTAIN = re.compile(
+    r"no confident match|no results for|found 0 node|nothing (?:found|stored|on that)",
+    re.IGNORECASE,
+)
+
+# A match the engine is willing to stand behind. Used only on negative controls.
+CONFIDENT = re.compile(r"== DIRECT ==|== RELATED ==|exact match", re.IGNORECASE)
+
+
 def run_recall(query):
-    """Run bq.py recall and return stdout."""
+    """Run one recall. Returns (stdout, stderr, returncode).
+
+    Nothing is swallowed. A crash must look like a crash to the caller, because
+    a battery that reads a dead engine as a quiet one is worse than no battery.
+    """
     cmd = [sys.executable, ENGRAM_CLI, "recall", query, "--limit", "5"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                                cwd=WORKSPACE)
-        return result.stdout
-    except Exception:
-        return ""
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                           cwd=WORKSPACE)
+        return r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        return "", "recall timed out after 60s", 124
+    except Exception as exc:
+        return "", f"could not run the engine: {exc}", 126
+
+
+def engine_failure(stderr, code):
+    """Return why the engine is broken, or None when it ran.
+
+    Broken means broken: a non-zero exit, or a traceback on stderr even when the
+    exit code lies. This is not a retrieval miss and must never be scored as one.
+    """
+    if code != 0:
+        return f"engine exited {code}: {_last_error_line(stderr)}"
+    if "Traceback (most recent call last)" in (stderr or ""):
+        return f"engine traceback: {_last_error_line(stderr)}"
+    return None
+
+
+def _last_error_line(stderr):
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else "no stderr"
 
 
 def mine_cases_from_db():
@@ -101,37 +141,35 @@ def mine_cases_from_db():
 
 
 def check_case(case):
-    """Run recall and check if expected node appears in results. Returns (passed, detail)."""
-    output = run_recall(case["query"])
-    if not output:
-        return False, "no output"
-
-    # Check if the node name appears in the output
-    if re.search(case["must_match"], output, re.IGNORECASE):
-        return True, "found"
-    return False, f"not found in results for '{case['query']}'"
+    """Positive case. Returns (passed, detail, broken)."""
+    out, err, code = run_recall(case["query"])
+    broken = engine_failure(err, code)
+    if broken:
+        return False, broken, True
+    if not out.strip():
+        return False, "the engine printed nothing at all", True
+    if re.search(case["must_match"], out, re.IGNORECASE):
+        return True, "found", False
+    return False, f"not found in results for '{case['query']}'", False
 
 
 def check_negative(query):
-    """Negative control: must NOT return a confident match."""
-    output = run_recall(query)
-    if not output:
-        return True, "no output (pass)"
+    """Negative control. Returns (passed, detail, broken).
 
-    # Check for explicit no-confident-match declaration
-    if re.search(r'no confident match', output, re.IGNORECASE):
-        return True, "no false positive (pass)"
-
-    # Check if there are actual confident results (not low-confidence/unverified)
-    # Look for confidence markers that indicate real matches
-    if re.search(r'(🔴|🟢|exact match|confident)', output, re.IGNORECASE):
-        # But only if there's no "no confident match" disclaimer
-        if not re.search(r'no confident|not confabulat', output, re.IGNORECASE):
-            # Check if there's actual content (not just "no results")
-            if re.search(r'\bno (results|matches|nodes)\b', output, re.IGNORECASE):
-                return True, "no false positive (pass)"
-            return False, "possible false positive"
-    return True, "no false positive (pass)"
+    A pass needs two things: the engine ran, and it said out loud that it has
+    nothing. Silence is not an abstain — silence is what a dead engine produces.
+    """
+    out, err, code = run_recall(query)
+    broken = engine_failure(err, code)
+    if broken:
+        return False, broken, True
+    if not out.strip():
+        return False, "the engine printed nothing at all — silence is not an abstain", True
+    if ABSTAIN.search(out):
+        return True, "explicit abstain", False
+    if CONFIDENT.search(out):
+        return False, "confident match on a question with no answer", False
+    return False, "no abstain and no match — unreadable result", False
 
 
 def main():
@@ -148,17 +186,20 @@ def main():
     passed = 0
     failed = 0
     failures = []
+    broken = []
 
     print(f"\nPositive cases ({len(cases)}):")
     for i, case in enumerate(cases, 1):
-        ok, detail = check_case(case)
-        status = "✅" if ok else "❌"
+        ok, detail, is_broken = check_case(case)
+        status = "✅" if ok else ("💥" if is_broken else "❌")
         print(f"  {status} [{case['type']}] '{case['query']}' → {case['node_name'][:40]} ({detail})")
         if ok:
             passed += 1
         else:
             failed += 1
             failures.append(f"  Case {i}: '{case['query']}' expected '{case['node_name'][:40]}' — {detail}")
+            if is_broken:
+                broken.append(f"  Case {i}: '{case['query']}' — {detail}")
 
     # Negative controls
     negatives = [
@@ -170,13 +211,15 @@ def main():
     print(f"\nNegative controls ({len(negatives)}):")
     neg_passed = 0
     for q in negatives:
-        ok, detail = check_negative(q)
-        status = "✅" if ok else "❌"
+        ok, detail, is_broken = check_negative(q)
+        status = "✅" if ok else ("💥" if is_broken else "❌")
         print(f"  {status} '{q}' ({detail})")
         if ok:
             neg_passed += 1
         else:
             failures.append(f"  Negative: '{q}' — {detail}")
+            if is_broken:
+                broken.append(f"  Negative: '{q}' — {detail}")
 
     # Summary
     total = len(cases) + len(negatives)
@@ -191,12 +234,26 @@ def main():
         for f in failures:
             print(f)
 
+    # A broken engine is not a bad score, it is no score. Say so and stop,
+    # before any percentage gets a chance to look reassuring.
+    if broken:
+        print(f"\n💥 ENGINE BROKEN — {len(broken)} case(s) could not run:")
+        for b in broken[:5]:
+            print(b)
+        if len(broken) > 5:
+            print(f"  ... and {len(broken) - 5} more")
+        print("\n❌ BATTERY FAILED (the engine did not run; these results mean nothing)")
+        sys.exit(1)
+
     # Gate: >=90% of mined positive cases (min 3 cases) + 3/3 negative.
     # Rate-based, not absolute: small workspaces mine fewer than 20 cases
-    # and must still be able to pass at a high hit rate.
-    min_needed = max(3, int(len(cases) * 0.9))
+    # and must still be able to pass at a high hit rate. Rounded up, because
+    # int() let 10/12 print as "≥90%" — a gate that rounds in its own favour
+    # is the same dishonesty as a battery that scores a crash as a pass.
+    min_needed = max(3, math.ceil(len(cases) * 0.9))
     if len(cases) >= 3 and passed >= min_needed and neg_passed == 3:
-        print(f"\n✅ BATTERY PASSED ({passed}/{len(cases)} positive ≥90% + 3/3 negative)")
+        pct = passed * 100 // max(len(cases), 1)
+        print(f"\n✅ BATTERY PASSED ({passed}/{len(cases)} positive = {pct}% ≥90% + 3/3 negative)")
         sys.exit(0)
     else:
         if len(cases) < 3:

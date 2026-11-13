@@ -17,6 +17,10 @@ Usage:
   python3 scripts/engram-battery.py --mine          # show mined cases only
   python3 scripts/engram-battery.py --run [--label X] [--limit N]
   python3 scripts/engram-battery.py --diff A B      # compare two saved runs
+
+Exit code: 0 when the run completed, 1 when the engine failed to run at all
+(non-zero exit or a traceback on any case). A low score is not an error; a
+dead engine is.
 """
 import argparse
 import json
@@ -81,19 +85,49 @@ INTENTION_CASES = [
 ]
 
 
+# An abstain is a result the engine chose to give. Silence is not one.
+ABSTAIN = re.compile(
+    r"no confident match|no results for|found 0 node|nothing (?:found|stored|on that)",
+    re.IGNORECASE,
+)
+
+
+def _last_error_line(stderr):
+    lines = [ln.strip() for ln in (stderr or '').splitlines() if ln.strip()]
+    return lines[-1] if lines else 'no stderr'
+
+
+def engine_failure(stderr, code):
+    """Return why the engine is broken, or None when it ran.
+
+    A non-zero exit or a traceback is a broken engine, not a retrieval miss.
+    Scoring one as the other is how a crash ships to users looking like a
+    mediocre hit rate.
+    """
+    if code != 0:
+        return f"engine exited {code}: {_last_error_line(stderr)}"
+    if 'Traceback (most recent call last)' in (stderr or ''):
+        return f"engine traceback: {_last_error_line(stderr)}"
+    return None
+
+
 def run_msgctx(message):
+    """Returns (stdout, stderr, returncode). Streams are kept apart on purpose."""
     try:
         r = subprocess.run(BQ + ['msgctx', message],
-                           capture_output=True, text=True, timeout=30, cwd=WS)
-        return (r.stdout or '') + (r.stderr or '')
+                           capture_output=True, text=True, timeout=60, cwd=WS)
+        return (r.stdout or ''), (r.stderr or ''), r.returncode
     except subprocess.TimeoutExpired:
-        return '<TIMEOUT>'
+        return '', 'msgctx timed out after 60s', 124
+    except Exception as exc:
+        return '', f'could not run the engine: {exc}', 126
 
 
 def run_intention_class():
-    """Returns (n, hit, failures). Arms a test intention, exercises msgctx,
-    then deletes the test node so the live engram is left untouched."""
+    """Returns (n, hit, failures, broken). Arms a test intention, exercises
+    msgctx, then deletes the test node so the live engram is left untouched."""
     failures = []
+    broken = []
     n = hit = 0
     # cleanup any stale copy first, then arm fresh
     subprocess.run(BQ + ['delete', '--name', INTENTION_NODE_NAME], capture_output=True, text=True, cwd=WS)
@@ -102,21 +136,26 @@ def run_intention_class():
     armed_ok = 'Armed' in (arm.stdout + arm.stderr) or 'Stored' in (arm.stdout + arm.stderr)
     try:
         for msg, should_fire in INTENTION_CASES:
-            out = run_msgctx(msg)
+            out, err, code = run_msgctx(msg)
+            dead = engine_failure(err, code)
             fired = '⏰ INTENTION' in out
-            ok = armed_ok and (fired == should_fire)
+            ok = (not dead) and armed_ok and (fired == should_fire)
             n += 1
             hit += ok
-            print(f"  {'✅' if ok else '❌'} [{'intention':13}] {msg[:60]!r} "
-                  f"(fire={fired}, want={should_fire})")
+            mark = '✅' if ok else ('💥' if dead else '❌')
+            print(f"  {mark} [{'intention':13}] {msg[:60]!r} "
+                  f"(fire={fired}, want={should_fire})"
+                  + (f" — {dead}" if dead else ""))
             if not ok:
                 failures.append({'class': 'intention', 'query': msg,
                                  'expect': f'fire={should_fire}',
                                  'node_id': None, 'tokens': len(out) // 4,
-                                 'out_head': out[:400]})
+                                 'error': dead, 'out_head': (out or err)[:400]})
+                if dead:
+                    broken.append(f"intention {msg[:50]!r}: {dead}")
     finally:
         subprocess.run(BQ + ['delete', '--name', INTENTION_NODE_NAME], capture_output=True, text=True, cwd=WS)
-    return n, hit, failures
+    return n, hit, failures, broken
 
 
 def informative_words(text, k=3):
@@ -168,13 +207,16 @@ def mine_cases(db, per_class=35):
 
 
 def run_recall(query, flags=()):
+    """Returns (stdout, stderr, returncode, elapsed_seconds)."""
     t0 = time.time()
     try:
         r = subprocess.run(BQ + ['recall', query, '--compact', '--budget', '400'] + list(flags),
-                           capture_output=True, text=True, timeout=30, cwd=WS)
-        return (r.stdout or '') + (r.stderr or ''), time.time() - t0
+                           capture_output=True, text=True, timeout=60, cwd=WS)
+        return (r.stdout or ''), (r.stderr or ''), r.returncode, time.time() - t0
     except subprocess.TimeoutExpired:
-        return '<TIMEOUT>', 30.0
+        return '', 'recall timed out after 60s', 124, 60.0
+    except Exception as exc:
+        return '', f'could not run the engine: {exc}', 126, time.time() - t0
 
 
 def main():
@@ -223,15 +265,24 @@ def main():
         print("use --mine or --run"); return
 
     stats = defaultdict(lambda: {'n': 0, 'hit': 0})
-    failures, tok_sum, ms_sum = [], 0, 0
+    failures, broken, tok_sum, ms_sum = [], [], 0, 0
     adv_notes = {q: (nn, note) for q, e, nn, note in ADVERSARIAL}
     for i, (cls, q, expect, flags, nid) in enumerate(cases):
-        out, el = run_recall(q, flags)
+        out, err, code, el = run_recall(q, flags)
         tokens = len(out) // 4
         tok_sum += tokens; ms_sum += el * 1000
-        if cls == 'negative':
-            # pass = no confident direct hit
-            hit = ('== DIRECT ==' not in out) or ('Found 0' in out)
+        dead = engine_failure(err, code)
+        if dead:
+            # Not a miss. The engine did not answer, so this case has no score.
+            hit = False
+        elif cls == 'negative':
+            # Pass only when the engine ran and said, in words, that it has
+            # nothing. An empty stdout is a symptom, not an abstain.
+            if not out.strip():
+                dead = 'the engine printed nothing at all'
+                hit = False
+            else:
+                hit = bool(ABSTAIN.search(out)) and '== DIRECT ==' not in out
         else:
             hit = bool(re.search(expect, out, re.I))
             nn, _ = adv_notes.get(q, (None, None))
@@ -242,15 +293,19 @@ def main():
         if not hit:
             failures.append({'class': cls, 'query': q, 'expect': expect,
                              'node_id': nid, 'tokens': tokens,
-                             'out_head': out[:400]})
-        print(f"  {'✅' if hit else '❌'} [{cls:13}] {q[:60]!r}")
+                             'error': dead, 'out_head': (out or err)[:400]})
+            if dead:
+                broken.append(f"[{cls}] {q[:50]!r}: {dead}")
+        mark = '✅' if hit else ('💥' if dead else '❌')
+        print(f"  {mark} [{cls:13}] {q[:60]!r}" + (f" — {dead}" if dead else ""))
 
     # prospective-memory (intention) class — stateful, runs through msgctx
     if not args.limit or args.limit >= 1:
-        i_n, i_hit, i_fail = run_intention_class()
+        i_n, i_hit, i_fail, i_broken = run_intention_class()
         stats['intention']['n'] += i_n
         stats['intention']['hit'] += i_hit
         failures.extend(i_fail)
+        broken.extend(i_broken)
 
     n = sum(s['n'] for s in stats.values())
     print(f"\n{'='*52}\nBATTERY RESULTS ({args.label})\n{'='*52}")
@@ -263,6 +318,7 @@ def main():
 
     result = {'label': args.label, 'total': n, 'hit': total_hit,
               'by_class': {k: dict(v) for k, v in stats.items()},
+              'broken': len(broken), 'broken_detail': broken[:20],
               'avg_tokens': tok_sum // max(rn, 1), 'avg_ms': int(ms_sum / max(rn, 1))}
     with open(f'{RESULTS_DIR}/battery-{args.label}.json', 'w') as f:
         json.dump(result, f, indent=1)
@@ -270,6 +326,18 @@ def main():
         for x in failures:
             f.write(json.dumps(x) + '\n')
     print(f"\nSaved: logs/battery-{args.label}.json (+failures.jsonl, {len(failures)} misses)")
+
+    # A broken engine ends the run. No percentage from a program that did not
+    # run is worth reading, and a battery that hides that is worse than none.
+    if broken:
+        print(f"\n💥 ENGINE BROKEN — {len(broken)} case(s) could not run:")
+        for b in broken[:5]:
+            print(f"  {b}")
+        if len(broken) > 5:
+            print(f"  ... and {len(broken) - 5} more")
+        print("❌ BATTERY FAILED (the engine did not run; these results mean nothing)")
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == '__main__':

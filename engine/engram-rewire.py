@@ -201,6 +201,17 @@ def add_crons():
 def main():
     print("Engram Rewire")
     print("=" * 50)
+    print("This will: back up MEMORY.md and AGENTS.md, replace MEMORY.md with a pointer,")
+    print("add an Engram section to AGENTS.md, and append 3 marked lines to your crontab.")
+    print("engram-uninstall.py reverts all of it.")
+    if "--yes" not in sys.argv:
+        try:
+            ans = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Aborted. Nothing changed. Re-run with --yes to skip this prompt.")
+            return
 
     # 1. Backup
     print("\n1. Backing up files...")
